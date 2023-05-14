@@ -1,6 +1,8 @@
-# TODO: Cache _error
+# TODO: Optimize linear case
+# TODO: Cache errors
 
-from functools import partial
+
+from functools import partial, cache
 
 import numpy as np
 
@@ -64,11 +66,11 @@ class SVM:
         self.tol = tol
         self.n_iter = 0
         self._dual_coef = np.array([])
+        self._kernel = partial(kernel_dict.get(kernel, 'linear'), *args, **kwargs)
+        self._error_cache = None
 
-        if seed:
+        if seed is not None:
             np.random.seed(seed)
-
-        self.kernel = partial(kernel_dict.get(kernel, 'linear'), *args, **kwargs)
 
     def evaluate(self, x):
         """
@@ -77,7 +79,7 @@ class SVM:
         :param x: point
         :return: SVM decision function value
         """
-        return np.sum(self._dual_coef * self._y * np.array([self.kernel(X_s, x) for X_s in self._X])) - self._b
+        return np.sum(self._dual_coef * self._y * np.array([self._kernel(X_s, x) for X_s in self._X])) - self._b
 
     def _error(self, i):
         """
@@ -86,6 +88,7 @@ class SVM:
         :param i: index of the sample
         :return: error
         """
+        # return self.error_cache.get(i, self.evaluate(self._X[i]) - self._y[i])
         return self.evaluate(self._X[i]) - self._y[i]
 
     def _examine_example(self, i2):
@@ -97,20 +100,22 @@ class SVM:
         """
         y2 = self._y[i2]
         alpha2 = self._dual_coef[i2]
-        E2 = self._error(i2)
+        E2 = self._error_cache[i2]
         r2 = E2 * y2
         if (r2 < -self.tol and alpha2 < self.C) or (r2 > self.tol and alpha2 > 0):
             # Select the second sample
             if len(self._dual_coef[(self._dual_coef > 0) & (self._dual_coef < self.C)]) > 1:
                 # Select the sample that maximizes the absolute difference between the errors
-                i1 = np.argmax([np.abs(E2 - self._error(i1)) for i1 in np.arange(self._N)])
+                i1 = np.argmax([np.abs(E2 - self._error_cache[i1]) for i1 in np.arange(self._N)])
                 if self._take_step(i1, i2):
                     return True
 
             # Select the second sample randomly
-            i1 = np.random.choice(np.arange(self._N)[(self._dual_coef > 0) & (self._dual_coef < self.C)])
-            if self._take_step(i1, i2):
-                return True
+            non_bound = np.arange(self._N)[(self._dual_coef > 0) & (self._dual_coef < self.C)]
+            if len(non_bound) > 0:
+                i1 = np.random.choice(non_bound)
+                if self._take_step(i1, i2):
+                    return True
 
             # Select the second sample randomly
             i1 = np.random.choice(np.arange(self._N))
@@ -130,7 +135,7 @@ class SVM:
             return False
 
         y1, y2 = self._y[i1], self._y[i2]
-        E1, E2 = self._error(i1), self._error(i2)
+        E1, E2 = self._error_cache[i1], self._error_cache[i2]
         alpha1, alpha2 = self._dual_coef[i1], self._dual_coef[i2]
         s = y1 * y2
 
@@ -141,9 +146,9 @@ class SVM:
             return False
 
         # Calculate eta
-        k11 = self.kernel(self._X[i1], self._X[i1])
-        k12 = self.kernel(self._X[i1], self._X[i2])
-        k22 = self.kernel(self._X[i2], self._X[i2])
+        k11 = self._kernel(self._X[i1], self._X[i1])
+        k12 = self._kernel(self._X[i1], self._X[i2])
+        k22 = self._kernel(self._X[i2], self._X[i2])
         eta = k11 + k22 - 2 * k12
 
         if eta > 0:
@@ -159,12 +164,28 @@ class SVM:
         if abs(a2 - alpha2) < self.tol * (a2 + alpha2 + self.tol):
             return False
 
+        # Update alpha1
         a1 = alpha1 + s * (alpha2 - a2)
 
-        # Update threshold to reflect change in Lagrange multipliers
+        # Calculate threshold to reflect change in Lagrange multipliers
         b1 = self._b + E1 + y1 * k11 * (a1 - alpha1) + y2 * k12 * (a2 - alpha2)
         b2 = self._b + E2 + y1 * k12 * (a1 - alpha1) + y2 * k22 * (a2 - alpha2)
-        self._b = b1 if 0 < a1 < self.C else b2 if 0 < a2 < self.C else (b1 + b2) / 2.
+        b_new = b1 if 0 < a1 < self.C else b2 if 0 < a2 < self.C else (b1 + b2) / 2.
+
+        # Update error cache for optimized alphas is set to 0 if they're unbound
+        for index, alpha in zip([i1, i2], [a1, a2]):
+            if 0.0 < alpha < self.C:
+                self._error_cache[index] = 0.0
+
+        # Set non-optimized errors based on equation 12.11 in Platt's book
+        for n in range(self._N):
+            if n != i1 and n != i2:
+                self._error_cache[n] = self._error_cache[n] + \
+                                        y1 * (a1 - alpha1) * self._kernel(self._X[i1], self._X[n]) + \
+                                        y2 * (a2 - alpha2) * self._kernel(self._X[i2], self._X[n]) + self._b - b_new
+
+        # Update threshold
+        self._b = b_new
 
         # Store new Lagrange multipliers
         self._dual_coef[i1], self._dual_coef[i2] = a1, a2
@@ -188,7 +209,10 @@ class SVM:
         self._b = 0
 
         # Initialize the dual coefficients
-        self._dual_coef = np.random.uniform(low=0, high=self.C, size=self._N)
+        self._dual_coef = np.zeros(self._N)
+
+        # Initialize the error cache
+        self._error_cache = np.array([self._error(i) for i in range(self._N)])
 
         num_changed = 0
         examine_all = True

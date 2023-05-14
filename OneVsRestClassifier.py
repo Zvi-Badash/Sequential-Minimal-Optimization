@@ -21,5 +21,8 @@ class OneVsRestClassifier:
             self._classifiers[i].fit(X, y_c)
 
     def predict(self, x):
-        idx = np.argmax([self._classifiers[i].evaluate(x) for i in range(self.n_classes)], axis=0)
+        idx = np.argmax([abs(self._classifiers[i].evaluate(x)) for i in range(self.n_classes)], axis=0)
         return self.class_labels[idx]
+
+    def evaluate(self, x):
+        return max([self._classifiers[i].evaluate(x) for i in range(self.n_classes)])
